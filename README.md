@@ -48,3 +48,14 @@ Two earlier fixes were reverted because they stored (or copied) requirements per
 |---|---|---|
 |Without fix (v1.14.1)|2|2 (unsatisfiable topology constraint)|
 |With [#3181](https://github.com/kubernetes-sigs/karpenter/pull/3181)|4|0|
+
+Karpenter's provisioner error for the pending pods shows the unreachable zone being counted (`us-east-1c` is only producible by the `3az` NodePool, yet appears in the domain counts and pins the global minimum at zero):
+
+```text
+could not schedule pod ... unsatisfiable topology constraint for topology spread,
+key=topology.kubernetes.io/zone (counts = us-east-1a: 1, us-east-1b: 1, us-east-1c: 0,
+podDomains = topology.kubernetes.io/zone Exists,
+nodeDomains = topology.kubernetes.io/zone In [us-east-1a us-east-1b])
+```
+
+Full captures are in the [aws-terraform](https://github.com/ssup2-playground/karpenter-topology-spread-issue_aws-terraform) repository under `test/result_*`.
