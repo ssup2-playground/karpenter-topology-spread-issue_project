@@ -58,4 +58,6 @@ podDomains = topology.kubernetes.io/zone Exists,
 nodeDomains = topology.kubernetes.io/zone In [us-east-1a us-east-1b])
 ```
 
+With the fixed controller image (`ghcr.io/ssup2-playground/karpenter:pr3181`, built from karpenter-provider-aws with #3181 applied), the two pending pods are provisioned immediately and the deployment spreads 2:2 across the `2az` NodePool's zones, with zero `could not schedule pod` errors.
+
 Full captures are in the [aws-terraform](https://github.com/ssup2-playground/karpenter-topology-spread-issue_aws-terraform) repository under `test/result_*`.
