@@ -26,11 +26,73 @@ The skew calculation compares each domain's pod count against the global minimum
 
 For example, with a NodePool `2az` (restricted to two zones) and a NodePool `3az` (all three zones), a deployment targeting `2az` via its pool label with a zone spread constraint schedules only two replicas (one per reachable zone): the third zone which only `3az` can produce is counted as a domain, pinning the global minimum at zero.
 
+## Previously Reverted Attempts
+
+Both prior fixes filtered domains correctly, but stored scheduling metadata **per domain**, so their cost multiplied with NodePool, instance type, and domain counts, and both were reverted after production regressions.
+
+### Attempt 1 ([#2639](https://github.com/kubernetes-sigs/karpenter/pull/2639)) : deep copy per domain → memory regression ([#2779](https://github.com/kubernetes-sigs/karpenter/issues/2779))
+
+Every domain stored its own deep copy of every producing NodePool's requirements. The same requirements were duplicated at `NodePool x InstanceType x Domain` cardinality on every scheduling loop.
+
+```text
+NodePool A (requirements: ~KBs)          NodePool B (requirements: ~KBs)
+     |                                        |
+     |  deep copy per domain                  |  deep copy per domain
+     v                                        v
+zone-a : [ Copy(Reqs A) ] [ Copy(Reqs B) ]
+zone-b : [ Copy(Reqs A) ] [ Copy(Reqs B) ]
+zone-c : [ Copy(Reqs B) ]
+
+memory = NodePools x InstanceTypes x Domains copies
+         (100 NodePools x 400 instance types -> GBs allocated per loop)
+```
+
+### Attempt 2 ([#2671](https://github.com/kubernetes-sigs/karpenter/pull/2671)) : serialize-to-dedup on every insert → CPU regression ([#2954](https://github.com/kubernetes-sigs/karpenter/issues/2954))
+
+Each domain stored `DomainSource{Requirements, Taints}` slices, and `Insert()` deduplicated by serializing the full requirements to a string — re-serializing every already-stored source on **every insert**. `Insert()` is called `NodePools x InstanceTypes x Domains` times per scheduling loop.
+
+```text
+Insert(zone-a, source)
+  -> serialize(source)                      // expensive
+  -> compare vs serialize(stored source 1)  // re-serialized every time
+             vs serialize(stored source 2)
+             vs ...
+
++1875% ~ +33440% slower as NodePool count grows (benchmarked at 1~100 NodePools)
+```
+
 ## How to solve this issue
 
 The fix ([kubernetes-sigs/karpenter#3181](https://github.com/kubernetes-sigs/karpenter/pull/3181)) tracks which NodePools can produce each domain, and counts a domain for a pod only if at least one producing NodePool passes the pod's `nodeTaintsPolicy` (the pod tolerates the NodePool's taints) and `nodeAffinityPolicy` (the NodePool's requirements are compatible with the pod's node selector and required node affinity).
 
-Two earlier fixes were reverted because they stored (or copied) requirements per domain, which exploded in memory (#2779) or CPU (#2954) as NodePool count grew. The third attempt constructs one `topologyNodePool{requirements, taints}` per NodePool, shared by pointer across every domain the NodePool can produce, and memoizes each NodePool's eligibility per pod — so per-pod filtering costs one taint/affinity evaluation per NodePool instead of per domain. This makes the fix faster and lighter than the unfixed code on every measured axis (NodePools 1–200, instance types 100–1000, zones 3–50, taint groups 1–20).
+Unlike the reverted attempts, nothing is stored per domain. One `topologyNodePool{requirements, taints}` is constructed **per NodePool** and shared by pointer across every domain the NodePool can produce; domains only append 8-byte pointers, and deduplication is an O(1) pointer comparison.
+
+```text
+topologyNodePool A (built once)     topologyNodePool B (built once)
+        ^                                   ^
+        |  every ptr->A below is the same   |  every ptr->B below is the same
+        |  single object, never copied      |  single object, never copied
+
+zone-a : [ ptr->A , ptr->B ]
+zone-b : [ ptr->A , ptr->B ]
+zone-c : [ ptr->B ]
+
+memory = NodePools metadata + one 8-byte pointer per (domain, producer)
+```
+
+Per-pod filtering memoizes each NodePool's eligibility by pointer, so a pod costs one taint/affinity evaluation per NodePool instead of per domain:
+
+```text
+ForEachDomain(pod):
+  eligible = {}                        // memo, keyed by pointer
+  zone-a: eligible[A]? -> evaluate(A)=true   -> count zone-a
+  zone-b: eligible[A]? -> memo hit (true)    -> count zone-b
+  zone-c: eligible[B]? -> evaluate(B)=false  -> skip zone-c
+
+evaluations per pod = NodePools (2), not Domains x Producers
+```
+
+This makes the fix faster and lighter than the unfixed code on every measured axis (NodePools 1-200, instance types 100-1000, zones 3-50, taint groups 1-20).
 
 ## Issue Test
 
