@@ -49,17 +49,35 @@ memory = NodePools x InstanceTypes x Domains copies
 
 ### Attempt 2 ([#2671](https://github.com/kubernetes-sigs/karpenter/pull/2671)) : serialize-to-dedup on every insert → CPU regression ([#2954](https://github.com/kubernetes-sigs/karpenter/issues/2954))
 
-Each domain stored `DomainSource{Requirements, Taints}` slices, and `Insert()` deduplicated by serializing the full requirements to a string — re-serializing every already-stored source on **every insert**. `Insert()` is called `NodePools x InstanceTypes x Domains` times per scheduling loop.
+Each domain stored a list of `DomainSource{Requirements, Taints}` values — one per NodePool that can produce the domain (the same role as this fix's `topologyNodePool`, but stored by value per domain).
+
+Domains are collected by iterating every NodePool's instance type offerings, so `Insert()` is unavoidably called many times with the same (domain, NodePool) pair — once per instance type — and the whole collection reruns on every scheduling loop:
 
 ```text
-Insert(zone-a, source)
-  -> serialize(source)                      // expensive
-  -> compare vs serialize(stored source 1)  // re-serialized every time
-             vs serialize(stored source 2)
-             vs ...
+every scheduling loop:
+  for each NodePool (N):
+    for each InstanceType of the NodePool (M):
+      for each zone the InstanceType offers (D):
+        Insert(zone, DomainSource of this NodePool)
+
+NodePool A with 400 instance types, all offering zone-a
+  -> Insert(zone-a, source of A) is called 400 times -> dedup is required
+```
+
+The problem was the cost of each dedup: `Insert()` serialized the full requirements to a string for comparison, without caching — so every already-stored source was re-serialized on every insert.
+
+```text
+Insert(zone-a, newSource):
+  key = serialize(newSource.Requirements)          // expensive, every call
+  for stored in zone-a.sources:
+    if serialize(stored.Requirements) == key:      // stored ones re-serialized too
+      return
+  append
 
 +1875% ~ +33440% slower as NodePool count grows (benchmarked at 1~100 NodePools)
 ```
+
+This fix keeps the same `Insert()` call pattern but makes each dedup an O(1) pointer comparison: inserts for one NodePool are contiguous, so comparing against the last recorded producer suffices.
 
 ## How to solve this issue
 
